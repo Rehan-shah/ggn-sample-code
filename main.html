@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Federated Learning Client with DHT and Load Balancing</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/web3@1.5.2/dist/web3.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.3.2/dist/peerjs.min.js"></script>
+</head>
+
+<body>
+    <h1>Federated Learning Client with DHT and Load Balancing</h1>
+    <button onclick="startFederatedLearning()">Start Federated Learning</button>
+
+    <script>
+        const serverUrl = 'http://your-server-url:5000';
+        const web3 = new Web3(Web3.givenProvider || 'https://polygon-mumbai.infura.io/v3/YOUR_INFURA_PROJECT_ID');
+        let model;
+        let peer;
+        let dht = new Map();
+        let nearbyPeers = new Set();
+
+        async function startFederatedLearning() {
+            model = await tf.loadLayersModel(`${serverUrl}/get-model`);
+            initializePeer();
+            runFederatedLearning();
+        }
+
+        function initializePeer() {
+            peer = new Peer();
+            peer.on('open', (id) => {
+                console.log('My peer ID is: ' + id);
+                updateDHT(id);
+            });
+            peer.on('connection', (conn) => {
+                conn.on('data', (data) => {
+                    handlePeerMessage(conn, data);
+                });
+            });
+        }
+
+        async function updateDHT(peerId) {
+            const position = await getCurrentPosition();
+            const locationKey = getLocationKey(position);
+            if (!dht.has(locationKey)) {
+                dht.set(locationKey, new Set());
+            }
+            dht.get(locationKey).add(peerId);
+            findNearbyPeers(locationKey);
+        }
+
+        function getLocationKey(position) {
+            const lat = Math.floor(position.coords.latitude);
+            const lon = Math.floor(position.coords.longitude);
+            return `${lat},${lon}`;
+        }
+
+        function getCurrentPosition() {
+            return new Promise((resolve, reject) => {
+                navigator.geolocation.getCurrentPosition(resolve, reject);
+            });
+        }
+
+        function findNearbyPeers(locationKey) {
+            const [lat, lon] = locationKey.split(',').map(Number);
+            for (let i = -1; i <= 1; i++) {
+                for (let j = -1; j <= 1; j++) {
+                    const nearbyKey = `${lat + i},${lon + j}`;
+                    if (dht.has(nearbyKey)) {
+                        dht.get(nearbyKey).forEach(peerId => {
+                            if (peerId !== peer.id) {
+                                nearbyPeers.add(peerId);
+                                connectToPeer(peerId);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        function connectToPeer(peerId) {
+            const conn = peer.connect(peerId);
+            conn.on('open', () => {
+                console.log(`Connected to peer: ${peerId}`);
+                conn.send({type: 'hello', peerId: peer.id});
+            });
+        }
+
+        function handlePeerMessage(conn, data) {
+            if (data.type === 'hello') {
+                console.log(`Received hello from peer: ${data.peerId}`);
+                nearbyPeers.add(data.peerId);
+            } else if (data.type === 'trainingRequest') {
+                handleTrainingRequest(conn, data);
+            } else if (data.type === 'trainingResponse') {
+                handleTrainingResponse(data);
+            }
+        }
+
+        async function runFederatedLearning() {
+            while (true) {
+                const {weights, round} = await fetchModelFromServer();
+                model.setWeights(weights.map(w => tf.tensor(w)));
+
+                const data = await getLocalData();
+                const updates = await trainModelWithLoadBalancing(data);
+
+                await sendUpdateToServer(updates, round);
+                await shareLearningProgress(updates);
+
+                await new Promise(resolve => setTimeout(resolve, 3600000));
+            }
+        }
+
+        async function fetchModelFromServer() {
+            const response = await fetch(`${serverUrl}/get-model`);
+            return await response.json();
+        }
+
+        async function getLocalData() {
+            const numSamples = 1000;
+            const xData = Array.from({length: numSamples}, () => Array.from({length: 784}, () => Math.random()));
+            const yData = Array.from({length: numSamples}, () => Array.from({length: 10}, () => Math.random()));
+            return {x: tf.tensor2d(xData), y: tf.tensor2d(yData)};
+        }
+
+        async function trainModelWithLoadBalancing(data) {
+            const computeLoad = await measureComputeLoad();
+            console.log(`Current compute load: ${computeLoad.toFixed(2)}`);
+            if (computeLoad > 0.5) {
+                console.log("Distributing training due to high load");
+                return await distributeTraining(data);
+            } else {
+                console.log("Training locally due to acceptable load");
+                return await trainLocally(data);
+            }
+        }
+
+        async function measureComputeLoad() {
+            const cpuLoad = await measureCPULoad();
+            const memoryLoad = measureMemoryLoad();
+            return (cpuLoad * 0.7) + (memoryLoad * 0.3);
+        }
+
+        async function measureCPULoad() {
+            const startTime = performance.now();
+            const iterations = 1000000;
+            await new Promise(resolve => {
+                let result = 0;
+                for (let i = 0; i < iterations; i++) {
+                    result += Math.random();
+                }
+                resolve();
+            });
+            const endTime = performance.now();
+            const duration = endTime - startTime;
+            return Math.min(Math.max((duration - 100) / 900, 0.1), 1.0);
+        }
+
+        function measureMemoryLoad() {
+            if (performance.memory) {
+                const usedJSHeapSize = performance.memory.usedJSHeapSize;
+                const jsHeapSizeLimit = performance.memory.jsHeapSizeLimit;
+                return usedJSHeapSize / jsHeapSizeLimit;
+            } else if (window.navigator.deviceMemory) {
+                return (8 - window.navigator.deviceMemory) / 8;
+            } else {
+                return 0.5;
+            }
+        }
+
+        async function distributeTraining(data) {
+            const chunks = splitData(data, nearbyPeers.size + 1);
+            const localChunk = chunks.pop();
+            const peerPromises = Array.from(nearbyPeers).map((peerId, index) => {
+                return new Promise((resolve) => {
+                    const conn = peer.connect(peerId);
+                    conn.on('open', () => {
+                        conn.send({
+                            type: 'trainingRequest',
+                            data: chunks[index],
+                            modelWeights: model.getWeights().map(w => w.arraySync())
+                        });
+                        conn.on('data', (response) => {
+                            if (response.type === 'trainingResponse') {
+                                resolve(response.updates);
+                            }
+                        });
+                    });
+                });
+            });
+            const localUpdates = await trainLocally(localChunk);
+            const peerUpdates = await Promise.all(peerPromises);
+            return aggregateUpdates([localUpdates, ...peerUpdates]);
+        }
+
+        function splitData(data, parts) {
+            const splitSize = Math.floor(data.x.shape[0] / parts);
+            const chunks = [];
+            for (let i = 0; i < parts; i++) {
+                const start = i * splitSize;
+                const end = (i === parts - 1) ? data.x.shape[0] : (i + 1) * splitSize;
+                chunks.push({
+                    x: data.x.slice([start, 0], [end - start, -1]),
+                    y: data.y.slice([start, 0], [end - start, -1])
+                });
+            }
+            return chunks;
+        }
+
+        async function trainLocally(data) {
+            await model.fit(data.x, data.y, {
+                epochs: 1,
+                batchSize: 32
+            });
+            return model.getWeights().map(w => w.arraySync());
+        }
+
+        function aggregateUpdates(allUpdates) {
+            const aggregated = allUpdates[0].map((_, i) => {
+                const layerUpdates = allUpdates.map(update => update[i]);
+                return layerUpdates.reduce((acc, val) => acc.map((x, j) => x + val[j] / allUpdates.length), layerUpdates[0]);
+            });
+            return aggregated;
+        }
+
+        async function handleTrainingRequest(conn, data) {
+            const tempModel = await tf.loadLayersModel(tf.io.fromMemory(data.modelWeights));
+            await tempModel.fit(data.data.x, data.data.y, {
+                epochs: 1,
+                batchSize: 32
+            });
+            const updates = tempModel.getWeights().map(w => w.arraySync());
+            conn.send({type: 'trainingResponse', updates: updates});
+        }
+
+        function handleTrainingResponse(data) {
+            console.log('Received training response from peer');
+        }
+
+        async function sendUpdateToServer(updates, round) {
+            const response = await fetch(`${serverUrl}/send-update`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    update: updates,
+                    round: round,
+                    clientAddress: (await web3.eth.getAccounts())[0]
+                })
+            });
+            const result = await response.json();
+            console.log(result.message);
+        }
+
+        async function shareLearningProgress(updates) {
+            nearbyPeers.forEach(peerId => {
+                const conn = peer.connect(peerId);
+                conn.on('open', () => {
+                    conn.send({type: 'trainingResponse', updates: updates});
+                });
+            });
+        }
+    </script>
+</body>
+
+</html>
